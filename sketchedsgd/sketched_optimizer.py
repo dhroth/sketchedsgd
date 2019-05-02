@@ -7,7 +7,7 @@ from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.parallel_apply import parallel_apply
 import torch.nn as nn
 
-import ipdb
+#import ipdb
 #import line_profiler
 #import atexit
 #profile = line_profiler.LineProfiler()
@@ -63,6 +63,11 @@ class SketchedSGD(torch.optim.Optimizer):
         else:
             opt = self.__dict__["opt"]
             setattr(opt, name, value)
+
+class SketchedModel(nn.Module):
+    def __init__(self, model):
+        super().__init__(self)
+        torch.cuda.device_count()
 
 
 class SketchedSum:
