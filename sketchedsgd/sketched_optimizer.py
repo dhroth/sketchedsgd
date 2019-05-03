@@ -14,15 +14,41 @@ import torch.nn as nn
 #atexit.register(profile.print_stats)
 
 def topk(vec, k):
+    """ Return the largest k elements (by magnitude) of vec"""
     ret = torch.zeros_like(vec)
+
+    # on a gpu, sorting is faster than pytorch's topk method
     topkIndices = torch.sort(vec**2)[1][-k:]
     #_, topkIndices = torch.topk(vec**2, k)
+
     ret[topkIndices] = vec[topkIndices]
     return ret
 
 
 class SketchedSGD(torch.optim.Optimizer):
+    """SketchedSGD optimizer
+
+    This is a thin wrapper over optim.SGD. Most of the work to do
+    sketching is in SketchedSum. SketchedSum handles the learning rate,
+    momentum, and weight decay, so we don't want the user's optim.SGD
+    instance to apply them a second time.
+    """
     def __init__(self, opt, k, accumulateError=True, p1=0, p2=0):
+        """SketchedSGD Constructor
+
+        Args:
+            opt: the optim.SGD instance you were using before applying
+                 sketching
+            k: how many gradient elements to extract from the sketches
+            accumulateError: whether or not to accumulate error in the
+                             workers
+            p1: truncate worker gradients to p1*k before sketching. If
+                zero, don't truncate
+            p2: the parameter server extracts p2*k heavy hitters from
+                the summed sketches, requests p2*k actual gradient values
+                from each worker, and then computes the topk of the sum
+                of the actual values
+        """
         # nesterov not supported
         assert(opt.defaults["nesterov"] == False)
         self.opt = opt
@@ -30,8 +56,8 @@ class SketchedSGD(torch.optim.Optimizer):
         self.weight_decay = opt.defaults["weight_decay"]
         # take the actual steps with basicOpt, since the computation
         # of the weight update is done jointly between the workers
-        # and the master in sketchedSum
-        #self.basicOpt = torch.optim.SGD(opt.param_groups, lr=1)
+        # and the master in SketchedSum
+
         params = []
         for group in opt.param_groups:
             for p in group["params"]:
@@ -43,9 +69,11 @@ class SketchedSGD(torch.optim.Optimizer):
         self.p2 = p2
 
     def zero_grad(self):
+        """Zero out the gradient"""
         self.basicOpt.zero_grad()
 
     def step(self):
+        """Step the optimizer"""
         # the weight update, including lr, momentum, weight decay,
         # and error accumulation, was calculated by sketchedSum
         # and is in self.opt.param_groups
@@ -71,8 +99,39 @@ class SketchedModel(nn.Module):
 
 
 class SketchedSum:
+    """Sums a tensor s.t. gradients of the sum are sketched during backward
+
+    Normally, the loss is computed as
+    loss = criterion(predictions, ground_truth).sum()
+    where the sum() is over the batch dimension.
+
+    In order to sketch the gradients of loss during the backward()
+    computation, replace the above with
+    summer = SketchedSum(...)
+    loss = summer(criterion(predictions, ground_truth))
+
+    Now, when loss.backward() is called, the gradients in each leaf of
+    the computation graph will be the result of computing the gradient
+    on several workers, sketching the gradients, summing the sketches,
+    and extracting the topk values of the summed sketch, possibly with a
+    second round of communication between the workers and parameter server.
+    """
     def __init__(self, opt, c, r, numWorkers,
                  numBlocks=1, doTrueTopk=False):
+        """SketchedSum constructor
+
+        Args:
+            opt: an instance of torch.optim.SGD whose momentum and weight
+                 decay we want to emulate
+            c: number of columns in the sketch
+            r: numbers of rows in the sketch
+            numWorkers: how many workers to divide the gradient
+                        computation among
+            numBlocks: memory optimization for the sketch (higher means
+                       less memory used, but randomness becomes correlated)
+            doTrueTopk: instead of sketching, compute the true topk
+                        of the sum of the workers' gradients
+        """
         self.opt = opt
         D = 0
         for group in opt.param_groups:
@@ -105,6 +164,7 @@ class SketchedSum:
                                    for _ in range(numWorkers)]
 
     def _getGradShapes(self):
+        """Return the shapes and sizes of the weight matrices"""
         with torch.no_grad():
             gradShapes = []
             gradSizes = []
@@ -119,6 +179,7 @@ class SketchedSum:
             return gradShapes, gradSizes
 
     def _getGradVec(self):
+        """Return the gradient flattened to a vector"""
         gradVec = []
         with torch.no_grad():
             # flatten
@@ -135,6 +196,13 @@ class SketchedSum:
         return gradVec
 
     def _getLRVec(self):
+        """Return a vector of each gradient element's learning rate
+
+        If all parameters have the same learning rate, this just
+        returns torch.ones(D) * learning_rate. In this case, this
+        function could be memory-optimized by returning just a single
+        number.
+        """
         lrVec = []
         for group in self.opt.param_groups:
             lr = group["lr"]
@@ -147,6 +215,7 @@ class SketchedSum:
         return torch.cat(lrVec)
 
     def _getParamVec(self):
+        """Returns the current model weights as a vector"""
         d = []
         for group in self.opt.param_groups:
             for p in group["params"]:
@@ -154,6 +223,7 @@ class SketchedSum:
         return torch.cat(d).to(self.device)
 
     def _setGradVec(self, vec):
+        """Set the gradient to vec"""
         # put vec into p.grad.data
         vec = vec.to(self.modelDevice)
         gradShapes, gradSizes = self._getGradShapes()
@@ -180,6 +250,7 @@ class SketchedSum:
             self.print_graph(subg[0], level+1)
 
     def __call__(self, loss):
+        """Partition the loss into numWorkers parts along the batch axis"""
         self.loss = loss
         batchSize = loss.size()[0]
         self.losses = []
@@ -190,6 +261,17 @@ class SketchedSum:
         return self
 
     def _backwardWorker(self, workerId, doAggregate=True):
+        """Do a backward pass for one worker
+
+        Args:
+            workerId: which worker to do the backward pass for (between
+                      0 and self.numWorkers - 1)
+            doAggregate: whether or not the next step is to aggregate
+                         the workers' gradients. If so, we will sketch
+                         the computed gradient. Otherwise, we plan to
+                         call backwardWorker() again and accumulate.
+                         (bad abstraction and not really tested, sorry)
+        """
         if workerId == self.numWorkers - 1:
             retain_graph = False
         else:
@@ -239,6 +321,13 @@ class SketchedSum:
                 self.workerSketches[workerId] += self.vs[workerId]
 
     def _aggregateSketches(self):
+        """Aggregate the sketches of each worker
+
+        If p2 > 0, do a second round of communication between the
+        parameter server and the workers in order to get a better
+        estimate of the topk (both which elements are in the topk and
+        the values of those elements)
+        """
         weightUpdate = None
         if self.opt.doAccumulateError:
             # get candidate topk, then do second round of communication
@@ -278,10 +367,23 @@ class SketchedSum:
         return weightUpdate
 
     def _aggregateVs(self):
+        """Aggregate the error accumulation vectors directly
+
+        Used when doing the true topk instead of sketching.
+        """
         return topk(sum(self.vs), k=self.opt.k)
 
     #@profile
     def backward(self, doAggregate=True):
+        """Perform a backward pass, computing the gradient of the loss
+
+        Args:
+            doAggregate: whether or not to aggregate the workers'
+                         gradients after computing them. Set to False
+                         if, e.g., you plan to take a step on each worker
+                         before sending the gradients back to the parameter
+                         server.  (this is not really tested, sorry)
+        """
         # need to save the existing gradient so we can accumulate the
         # new gradient instead of replacing the old
         initialGradVec = self._getGradVec()
@@ -329,11 +431,13 @@ class SketchedSum:
 
 
     def item(self):
+        """Return the value of the loss"""
         with torch.no_grad():
             return self.loss.sum().item()
 
     def __div__(self, factor):
         return self.div(factor)
+
     def __truediv__(self, factor):
         return self.div(factor)
 
