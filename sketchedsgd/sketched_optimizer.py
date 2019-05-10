@@ -266,9 +266,12 @@ class SketchedSum:
 
         If all parameters have the same learning rate, this just
         returns torch.ones(D) * learning_rate. In this case, this
-        function could be memory-optimized by returning just a single
+        function is memory-optimized by returning just a single
         number.
         """
+        if len(self.opt.param_groups) == 1:
+            return self.opt.param_groups[0]["lr"]
+
         lrVec = []
         for group in self.opt.param_groups:
             lr = group["lr"]
