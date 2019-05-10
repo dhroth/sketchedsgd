@@ -115,10 +115,35 @@ class SketchedSGD(torch.optim.Optimizer):
             opt = self.__dict__["opt"]
             setattr(opt, name, value)
 
-class SketchedModel(nn.Module):
-    def __init__(self, model):
-        super().__init__(self)
-        torch.cuda.device_count()
+class SketchedModel:
+    # not inheriting from nn.Module to avoid the fact that implementing
+    # __getattr__ on a nn.Module is tricky, since self.model = model
+    # doesn't actually add "model" to self.__dict__ -- instead, nn.Module
+    # creates a key/value pair in some internal dictionary that keeps
+    # track of submodules
+    def __init__(self, model, sketchBiases=False):
+        self.model = model
+        # sketch everything by default
+        for p in model.parameters():
+            p.do_sketching = True
+
+        if not sketchBiases:
+            for m in model.modules():
+                if isinstance(m, torch.nn.Linear):
+                    m.weight.do_sketching = True
+                    m.bias.do_sketching = False
+
+    def __call__(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+    def __setattr__(self, name, value):
+        if name == "model":
+            self.__dict__[name] = value
+        else:
+            self.model.setattr(name, value)
 
 
 class SketchedSum:
@@ -156,13 +181,6 @@ class SketchedSum:
                         of the sum of the workers' gradients
         """
         self.opt = opt
-        D = 0
-        for group in opt.param_groups:
-            for p in group["params"]:
-                if p.requires_grad:
-                    D += np.prod(p.data.shape)
-        self.D = D
-        print("D", self.D)
         self.c = c
         self.r = r
         self.numWorkers = numWorkers
@@ -174,14 +192,39 @@ class SketchedSum:
         self.device = "cuda"
         print("making sketches")
         print("device", self.device)
+
+        D = 0
+        sketchMask = []
+        for group in opt.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    size = np.prod(p.data.shape)
+                    if p.do_sketching:
+                        sketchMask.append(torch.ones(size))
+                    else:
+                        sketchMask.append(torch.zeros(size))
+                    D += size
+        self.D = D
+        # a mask indicating which gradient elements we should sketch
+        # and which we should send without compression (e.g. bias terms,
+        # maybe early layers, etc.)
+        self.sketchMask = torch.cat(sketchMask).byte().to(self.device)
+
+        print("D: {}".format(D))
+        print("sketchMask.sum(): {}".format(self.sketchMask.sum()))
+
+
         self.us = [torch.zeros(D, device=self.device)
                    for _ in range(numWorkers)]
         self.vs = [torch.zeros(D, device=self.device)
                    for _ in range(numWorkers)]
 
+        # don't need sketches for true topk
         if not self.doTrueTopk:
-            # don't need sketches for true topk
-            self.workerSketches = [CSVec(d=D, c=c, r=r,
+            # dimensionality of the sketch (d) is the number of gradient
+            # elements that we're going to sketch, i.e. sketchMask.sum()
+            self.workerSketches = [CSVec(d=self.sketchMask.sum(),
+                                         c=c, r=r,
                                          device=self.device, nChunks=1,
                                          numBlocks=numBlocks)
                                    for _ in range(numWorkers)]
@@ -329,19 +372,21 @@ class SketchedSum:
             # sketch the current (modified) gradient in preparation for
             # aggregation by the parameter server
             self.workerSketches[workerId].zero()
+            maskedV = self.vs[workerId][self.sketchMask]
             if self.opt.doAccumulateError:
                 # sketch vs[workerId] into self.workerSketches[workerId]
                 if self.opt.p1 > 0:
                     # truncate and then sketch
-                    tk = topk(self.vs[workerId], self.opt.p1 * self.opt.k)
+                    tk = topk(maskedV, self.opt.p1 * self.opt.k)
                     self.workerSketches[workerId] += tk
                 else:
                     # sketch the full vector
-                    self.workerSketches[workerId] += self.vs[workerId]
+                    self.workerSketches[workerId] += maskedV
             else:
                 # if no error accumulation, then self.vs just accumulates
                 # gradients directly until we're ready to aggregate
-                self.workerSketches[workerId] += self.vs[workerId]
+                # TODO doAccumulateError=False not tested, probably broken
+                self.workerSketches[workerId] += maskedV
 
     def _aggregateSketches(self):
         """Aggregate the sketches of each worker
@@ -351,7 +396,14 @@ class SketchedSum:
         estimate of the topk (both which elements are in the topk and
         the values of those elements)
         """
-        weightUpdate = None
+        weightUpdate = torch.zeros_like(self.vs[0])
+        # for coords that we're not sketching, store the sum across
+        # workers directly in weightUpdate
+        weightUpdate[~self.sketchMask] = torch.sum(torch.cat(
+                    [self.vs[workerId][~self.sketchMask]
+                     for workerId in range(self.numWorkers)],
+                dim=1),
+            dim=1)[:,np.newaxis]
         if self.opt.doAccumulateError:
             # get candidate topk, then do second round of communication
             if self.opt.p2 > 0:
@@ -362,18 +414,21 @@ class SketchedSum:
                 candidateHHCoords = candidateTopk.nonzero()
                 # get exact values for candidateHHCoords
                 candidateTopk[candidateHHCoords] = torch.sum(torch.cat(
-                        [self.vs[workerId][candidateHHCoords]
-                         for workerId in range(self.numWorkers)],
+                    [self.vs[workerId][self.sketchMask][candidateHHCoords]
+                     for workerId in range(self.numWorkers)],
                     dim=1),
                 dim=1)[:,np.newaxis]
-                weightUpdate = topk(candidateTopk, k=self.opt.k)
-                #weightUpdate = topk(sum(self.vs), k=self.opt.k)
+                weightUpdate[self.sketchMask] = topk(candidateTopk,
+                                                     k=self.opt.k)
+                #weightUpdate[self.sketchMask = topk(sum(self.vs),
+                #                                    k=self.opt.k)
             else:
                 # if p2 == 0, then there's no second round of
                 # communication: we just use the values for the gradient
                 # that we got from the sketch
                 assert(self.opt.p2 == 0)
-                weightUpdate = np.sum(self.workerSketches).unSketch(k=self.opt.k)
+                weightUpdate[self.sketchMask] = np.sum(
+                        self.workerSketches).unSketch(k=self.opt.k)
 
             if False:
                 # just for debugging
@@ -394,7 +449,25 @@ class SketchedSum:
 
         Used when doing the true topk instead of sketching.
         """
-        return topk(sum(self.vs), k=self.opt.k)
+        weightUpdate = torch.zeros_like(self.vs[0])
+
+        # for coords we're not sketching, store the sum of vs
+        nonSketchedVs = torch.stack(
+                            [self.vs[workerId][~self.sketchMask]
+                             for workerId in range(self.numWorkers)]
+                        )
+        weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs, dim=0)
+
+        # for coords we are sketching (or top-k-ing), store the
+        # topk of the sum of vs
+        sketchedVs = torch.stack(
+                        [self.vs[workerId][self.sketchMask]
+                         for workerId in range(self.numWorkers)]
+                     )
+        weightUpdate[self.sketchMask] = topk(torch.sum(sketchedVs, dim=0),
+                                             k=self.opt.k)
+
+        return weightUpdate
 
     #@profile
     def backward(self, doAggregate=True):
@@ -428,14 +501,19 @@ class SketchedSum:
                 weightUpdate = self._aggregateSketches()
                 #print(torch.norm(weightUpdate))
 
+            #print(torch.stack(list(map(torch.std, self.vs))))
             if self.opt.doAccumulateError:
                 # zero out coordinates on each worker that the parameter
                 # server updates
                 hhCoords = weightUpdate.nonzero()
                 #print("HH nonzero", hhCoords.size())
                 for workerId in range(self.numWorkers):
+                    # the parameter server updated the heavy hitter
+                    # coords and also the coords that don't get sketched
                     self.us[workerId][hhCoords] = 0
+                    #self.us[workerId][~self.sketchMask] = 0
                     self.vs[workerId][hhCoords] = 0
+                    self.vs[workerId][~self.sketchMask] = 0
             else:
                 # if no error accumulation, self.vs just accumulates
                 # gradients directly until we aggregate them, at which
