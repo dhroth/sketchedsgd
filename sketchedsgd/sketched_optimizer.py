@@ -402,11 +402,12 @@ class SketchedSum:
         weightUpdate = torch.zeros_like(self.vs[0])
         # for coords that we're not sketching, store the sum across
         # workers directly in weightUpdate
-        weightUpdate[~self.sketchMask] = torch.sum(torch.cat(
-                    [self.vs[workerId][~self.sketchMask]
-                     for workerId in range(self.numWorkers)],
-                dim=1),
-            dim=1)[:,np.newaxis]
+        nonSketchedVs = torch.stack(
+                            [self.vs[workerId][~self.sketchMask]
+                             for workerId in range(self.numWorkers)]
+                        )
+        weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs,
+                                                   dim=0)
         if self.opt.doAccumulateError:
             # get candidate topk, then do second round of communication
             if self.opt.p2 > 0:
@@ -416,11 +417,11 @@ class SketchedSum:
                 # (i.e. the heavy hitters)
                 candidateHHCoords = candidateTopk.nonzero()
                 # get exact values for candidateHHCoords
-                candidateTopk[candidateHHCoords] = torch.sum(torch.cat(
+                candidateTopk[candidateHHCoords] = torch.sum(torch.stack(
                     [self.vs[workerId][self.sketchMask][candidateHHCoords]
-                     for workerId in range(self.numWorkers)],
-                    dim=1),
-                dim=1)[:,np.newaxis]
+                     for workerId in range(self.numWorkers)]
+                    ),
+                dim=0)
                 weightUpdate[self.sketchMask] = topk(candidateTopk,
                                                      k=self.opt.k)
                 #weightUpdate[self.sketchMask = topk(sum(self.vs),
@@ -454,15 +455,14 @@ class SketchedSum:
         """
         weightUpdate = torch.zeros_like(self.vs[0])
 
-        # for coords we're not sketching, store the sum of vs
+        # for coords we're not compressing, store the sum of vs
         nonSketchedVs = torch.stack(
                             [self.vs[workerId][~self.sketchMask]
                              for workerId in range(self.numWorkers)]
                         )
         weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs, dim=0)
 
-        # for coords we are sketching (or top-k-ing), store the
-        # topk of the sum of vs
+        # for coords we are compressing, store the topk of the sum of vs
         sketchedVs = torch.stack(
                         [self.vs[workerId][self.sketchMask]
                          for workerId in range(self.numWorkers)]
