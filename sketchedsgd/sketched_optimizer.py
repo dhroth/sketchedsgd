@@ -165,7 +165,7 @@ class SketchedSum:
     second round of communication between the workers and parameter server.
     """
     def __init__(self, opt, c, r, numWorkers,
-                 numBlocks=1, doTrueTopk=False):
+                 numBlocks=1, doTrueTopk=False, doLocalTopk=False):
         """SketchedSum constructor
 
         Args:
@@ -184,7 +184,11 @@ class SketchedSum:
         self.c = c
         self.r = r
         self.numWorkers = numWorkers
+        assert(not (doTrueTopk and doLocalTopk))
         self.doTrueTopk = doTrueTopk
+        self.doLocalTopk = doLocalTopk
+        # self.modelDevice is not tested... not sure what happens if
+        # the model is on the CPU
         if opt.param_groups[0]["params"][0].is_cuda:
             self.modelDevice = "cuda"
         else:
@@ -472,6 +476,28 @@ class SketchedSum:
 
         return weightUpdate
 
+    def _aggregateTopkVs(self):
+        """Aggregate the local topk of each workers' v vector"""
+        weightUpdate = torch.zeros_like(self.vs[0])
+
+        # for coords we're not compressing, store the sum of vs
+        nonSketchedVs = torch.stack(
+                            [self.vs[workerId][~self.sketchMask]
+                             for workerId in range(self.numWorkers)]
+                        )
+        weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs, dim=0)
+
+        # for coords we are compressing, store the sum of the topk of vs
+        sketchedVs = torch.stack(
+                [topk(self.vs[workerId][self.sketchMask], k=self.opt.k)
+                 for workerId in range(self.numWorkers)]
+            )
+        weightUpdate[self.sketchMask] = torch.sum(sketchedVs, dim=0)
+
+        return weightUpdate
+
+
+
     #@profile
     def backward(self, doAggregate=True):
         """Perform a backward pass, computing the gradient of the loss
@@ -499,6 +525,8 @@ class SketchedSum:
                 # for true top-k, just aggregate self.vs directly
                 weightUpdate = self._aggregateVs()
                 #print(torch.norm(weightUpdate))
+            elif self.doLocalTopk:
+                weightUpdate = self._aggregateTopkVs()
             else:
                 # for sketched top-k, aggregate the sketches
                 weightUpdate = self._aggregateSketches()
