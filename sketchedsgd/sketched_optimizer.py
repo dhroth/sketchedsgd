@@ -530,6 +530,8 @@ class SketchedSum:
                     u[self.sketchMask][sent] = 0
                     v[self.sketchMask][sent] = 0
                     v[~self.sketchMask] = 0
+                else:
+                    v.zero_()
 
         return weightUpdate
 
