@@ -6,6 +6,7 @@ from torch.nn.parallel.scatter_gather import scatter_kwargs, scatter, gather
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.parallel_apply import parallel_apply
 import torch.nn as nn
+import random
 
 #import ipdb
 #import line_profiler
@@ -164,8 +165,8 @@ class SketchedSum:
     and extracting the topk values of the summed sketch, possibly with a
     second round of communication between the workers and parameter server.
     """
-    def __init__(self, opt, c, r, numWorkers,
-                 numBlocks=1, doTrueTopk=False, doLocalTopk=False):
+    def __init__(self, opt, c, r, numWorkers, numBlocks=1,
+                 doTrueTopk=False, doLocalTopk=False, doRandomK=False):
         """SketchedSum constructor
 
         Args:
@@ -179,14 +180,24 @@ class SketchedSum:
                        less memory used, but randomness becomes correlated)
             doTrueTopk: instead of sketching, compute the true topk
                         of the sum of the workers' gradients
+            doLocalTopk: instead of sketching, send and then sum the local
+                         topk of each worker's v vector
+            doRandomK: instead of sketching, send a random set of
+                       k coordinates
         """
         self.opt = opt
         self.c = c
         self.r = r
         self.numWorkers = numWorkers
-        assert(not (doTrueTopk and doLocalTopk))
+        # at most one of true topk, local topk, and random k allowed
+        # (what can I say -- I don't believe in implicit casting?)
+        assert(((1 if doTrueTopk else 0) +
+                (1 if doLocalTopk else 0) +
+                (1 if doRandomK else 0)) <= 1)
         self.doTrueTopk = doTrueTopk
         self.doLocalTopk = doLocalTopk
+        self.doRandomK = doRandomK
+        self.doSketching = not (doTrueTopk or doLocalTopk or doRandomK)
         # self.modelDevice is not tested... not sure what happens if
         # the model is on the CPU
         if opt.param_groups[0]["params"][0].is_cuda:
@@ -194,7 +205,6 @@ class SketchedSum:
         else:
             self.modelDevice = "cpu"
         self.device = "cuda"
-        print("making sketches")
         print("device", self.device)
 
         D = 0
@@ -223,8 +233,9 @@ class SketchedSum:
         self.vs = [torch.zeros(D, device=self.device)
                    for _ in range(numWorkers)]
 
-        # don't need sketches for true topk
-        if not self.doTrueTopk:
+        # don't need sketches for true/local/random topk
+        if self.doSketching:
+            print("making sketches")
             # dimensionality of the sketch (d) is the number of gradient
             # elements that we're going to sketch, i.e. sketchMask.sum()
             self.workerSketches = [CSVec(d=self.sketchMask.sum().item(),
@@ -232,6 +243,8 @@ class SketchedSum:
                                          device=self.device, nChunks=1,
                                          numBlocks=numBlocks)
                                    for _ in range(numWorkers)]
+        else:
+            print("not making sketches")
 
     def _getGradShapes(self):
         """Return the shapes and sizes of the weight matrices"""
@@ -375,7 +388,7 @@ class SketchedSum:
         # after this gradient computation step (otherwise, we plan
         # to aggregate additional gradients before aggregating on
         # the parameter server)
-        if doAggregate and not self.doTrueTopk:
+        if doAggregate and self.doSketching:
             # sketch the current (modified) gradient in preparation for
             # aggregation by the parameter server
             self.workerSketches[workerId].zero()
@@ -497,6 +510,27 @@ class SketchedSum:
         return weightUpdate
 
 
+    def _aggregateRandomVs(self):
+        # we can only do this if we're compressing every coordinate
+        # main reason is sampling without replacement from an arbitrary
+        # subset of ~90M gradient coordinates takes a loong time
+        # (~5 seconds in torch or numpy)
+        assert(self.sketchMask.sum() == self.D)
+
+        # choose a random set of k coordinates and send those
+        # unfortunately currently no np.random.choice equivalent in torch
+        # and unfortunately, np.random.choice is slooooooow for k<<d
+        # fortunately, python's built-in random.sample is 50x faster....
+        randomCoords = random.sample(range(self.D), self.opt.k)
+        randomCoords = torch.tensor(randomCoords, device=self.device)
+
+        weightUpdate = torch.zeros_like(self.vs[0])
+        weightUpdate[randomCoords] = torch.sum(torch.stack(
+                            [self.vs[workerId][randomCoords]
+                             for workerId in range(self.numWorkers)]
+                        ), dim=0)
+
+        return weightUpdate
 
     #@profile
     def backward(self, doAggregate=True):
@@ -527,6 +561,8 @@ class SketchedSum:
                 #print(torch.norm(weightUpdate))
             elif self.doLocalTopk:
                 weightUpdate = self._aggregateTopkVs()
+            elif self.doRandomK:
+                weightUpdate = self._aggregateRandomVs()
             else:
                 # for sketched top-k, aggregate the sketches
                 weightUpdate = self._aggregateSketches()
