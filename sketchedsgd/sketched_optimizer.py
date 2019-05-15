@@ -509,7 +509,7 @@ class SketchedSum:
             )
         weightUpdate[self.sketchMask] = torch.sum(sketchedVs, dim=0)
 
-        if self.opt.p2 == 1
+        if self.opt.p2 == 1:
             # second round of communication
             HHs = weightUpdate.nonzero()
             weightUpdate[HHs] = sum([v[HHs] for v in self.vs])
@@ -522,14 +522,14 @@ class SketchedSum:
             # returning the weightUpdate from this function we don't
             # know which coords of each v vector should be zeroed out
             for u, v, sv in zip(self.us, self.vs, sketchedVs):
-                if self.opt.doAccumulateError
-                # zero out just the coordinates that we sent
-                # don't zero out u for ~self.sketchMask since no nee
-                # to stop momentum for coords sent every iteration
-                sent = sv.nonzero()
-                u[self.sketchMask][sent] = 0
-                v[self.sketchMask][sent] = 0
-                v[~self.sketchMask] = 0
+                if self.opt.doAccumulateError:
+                    # zero out just the coordinates that we sent
+                    # don't zero out u for ~self.sketchMask since no nee
+                    # to stop momentum for coords sent every iteration
+                    sent = sv.nonzero()
+                    u[self.sketchMask][sent] = 0
+                    v[self.sketchMask][sent] = 0
+                    v[~self.sketchMask] = 0
 
         return weightUpdate
 
