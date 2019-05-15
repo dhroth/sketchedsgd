@@ -557,7 +557,7 @@ class SketchedSum:
         return weightUpdate
 
     #@profile
-    def backward(self, doAggregate=True):
+    def backward(self, doAggregate=True, flushVs=False):
         """Perform a backward pass, computing the gradient of the loss
 
         Args:
@@ -567,6 +567,8 @@ class SketchedSum:
                          before sending the gradients back to the parameter
                          server.  (this is not really tested, sorry)
         """
+        if flushVs:
+            assert(doAggregate)
         # need to save the existing gradient so we can accumulate the
         # new gradient instead of replacing the old
         initialGradVec = self._getGradVec()
@@ -579,18 +581,21 @@ class SketchedSum:
             self._backwardWorker(workerId, doAggregate)
 
         if doAggregate:
-            if self.doTrueTopk:
-                # for true top-k, just aggregate self.vs directly
-                weightUpdate = self._aggregateVs()
-                #print(torch.norm(weightUpdate))
-            elif self.doLocalTopk:
-                weightUpdate = self._aggregateTopkVs()
-            elif self.doRandomK:
-                weightUpdate = self._aggregateRandomVs()
+            if flushVs:
+                weightUpdate = sum(self.vs)
             else:
-                # for sketched top-k, aggregate the sketches
-                weightUpdate = self._aggregateSketches()
-                #print(torch.norm(weightUpdate))
+                if self.doTrueTopk:
+                    # for true top-k, just aggregate self.vs directly
+                    weightUpdate = self._aggregateVs()
+                    #print(torch.norm(weightUpdate))
+                elif self.doLocalTopk:
+                    weightUpdate = self._aggregateTopkVs()
+                elif self.doRandomK:
+                    weightUpdate = self._aggregateRandomVs()
+                else:
+                    # for sketched top-k, aggregate the sketches
+                    weightUpdate = self._aggregateSketches()
+                    #print(torch.norm(weightUpdate))
 
             #print(torch.stack(list(map(torch.std, self.vs))))
             # BAD CODE ALERT -- see note in _aggregateTopkVs
