@@ -490,6 +490,8 @@ class SketchedSum:
         return weightUpdate
 
     def _aggregateTopkVs(self):
+        assert(self.opt.p2 in [0, 1])
+
         """Aggregate the local topk of each workers' v vector"""
         weightUpdate = torch.zeros_like(self.vs[0])
 
@@ -506,6 +508,28 @@ class SketchedSum:
                  for workerId in range(self.numWorkers)]
             )
         weightUpdate[self.sketchMask] = torch.sum(sketchedVs, dim=0)
+
+        if self.opt.p2 == 1
+            # second round of communication
+            HHs = weightUpdate.nonzero()
+            weightUpdate[HHs] = sum([v[HHs] for v in self.vs])
+
+        else:
+            assert(self.opt.p2 == 0)
+            # ALERT BAD CODE: this fragment below replaces what would
+            # normally run in backward() for non-localtopk modes
+            # but I can't do this there for local topk since after
+            # returning the weightUpdate from this function we don't
+            # know which coords of each v vector should be zeroed out
+            for u, v, sv in zip(self.us, self.vs, sketchedVs):
+                if self.opt.doAccumulateError
+                # zero out just the coordinates that we sent
+                # don't zero out u for ~self.sketchMask since no nee
+                # to stop momentum for coords sent every iteration
+                sent = sv.nonzero()
+                u[self.sketchMask][sent] = 0
+                v[self.sketchMask][sent] = 0
+                v[~self.sketchMask] = 0
 
         return weightUpdate
 
@@ -569,24 +593,28 @@ class SketchedSum:
                 #print(torch.norm(weightUpdate))
 
             #print(torch.stack(list(map(torch.std, self.vs))))
-            if self.opt.doAccumulateError:
-                # zero out coordinates on each worker that the parameter
-                # server updates
-                hhCoords = weightUpdate.nonzero()
-                #print("HH nonzero", hhCoords.size())
-                for workerId in range(self.numWorkers):
-                    # the parameter server updated the heavy hitter
-                    # coords and also the coords that don't get sketched
-                    self.us[workerId][hhCoords] = 0
-                    #self.us[workerId][~self.sketchMask] = 0
-                    self.vs[workerId][hhCoords] = 0
-                    self.vs[workerId][~self.sketchMask] = 0
-            else:
-                # if no error accumulation, self.vs just accumulates
-                # gradients directly until we aggregate them, at which
-                # point each worker is completely zeroed out
-                for workerId in range(self.numWorkers):
-                    self.vs[workerId].zero_()
+            # BAD CODE ALERT -- see note in _aggregateTopkVs
+            localTopkException = self.doLocalTopk and (self.opt.p2 == 0)
+            if not localTopkException:
+                if self.opt.doAccumulateError:
+                    # zero out coordinates on each worker that the
+                    # parameter server updates
+                    hhCoords = weightUpdate.nonzero()
+                    #print("HH nonzero", hhCoords.size())
+                    for workerId in range(self.numWorkers):
+                        # the parameter server updated the heavy hitter
+                        # coords and also the coords that don't get
+                        # sketched
+                        self.us[workerId][hhCoords] = 0
+                        #self.us[workerId][~self.sketchMask] = 0
+                        self.vs[workerId][hhCoords] = 0
+                        self.vs[workerId][~self.sketchMask] = 0
+                else:
+                    # if no error accumulation, self.vs just accumulates
+                    # gradients directly until we aggregate them, at which
+                    # point each worker is completely zeroed out
+                    for workerId in range(self.numWorkers):
+                        self.vs[workerId].zero_()
 
             # add back the initial gradient vector
             weightUpdate.add_(initialGradVec)
