@@ -346,17 +346,12 @@ class SketchedSum:
             self.losses.append(loss[start:end].sum() / self.numWorkers)
         return self
 
-    def _backwardWorker(self, workerId, doAggregate=True):
+    def _backwardWorker(self, workerId):
         """Do a backward pass for one worker
 
         Args:
             workerId: which worker to do the backward pass for (between
                       0 and self.numWorkers - 1)
-            doAggregate: whether or not the next step is to aggregate
-                         the workers' gradients. If so, we will sketch
-                         the computed gradient. Otherwise, we plan to
-                         call backwardWorker() again and accumulate.
-                         (bad abstraction and not really tested, sorry)
         """
         if workerId == self.numWorkers - 1:
             retain_graph = False
@@ -384,31 +379,82 @@ class SketchedSum:
         else:
             self.vs[workerId] += gradVec
 
-        # doAggregate means we're going to aggregate all the workers
-        # after this gradient computation step (otherwise, we plan
-        # to aggregate additional gradients before aggregating on
-        # the parameter server)
-        if doAggregate and self.doSketching:
-            # sketch the current (modified) gradient in preparation for
-            # aggregation by the parameter server
-            self.workerSketches[workerId].zero()
-            maskedV = self.vs[workerId][self.sketchMask]
-            if self.opt.doAccumulateError:
-                # sketch vs[workerId] into self.workerSketches[workerId]
-                if self.opt.p1 > 0:
-                    # truncate and then sketch
-                    tk = topk(maskedV, self.opt.p1 * self.opt.k)
-                    self.workerSketches[workerId] += tk
-                else:
-                    # sketch the full vector
-                    self.workerSketches[workerId] += maskedV
-            else:
-                # if no error accumulation, then self.vs just accumulates
-                # gradients directly until we're ready to aggregate
-                # TODO doAccumulateError=False not tested, probably broken
-                self.workerSketches[workerId] += maskedV
+    # the helper functions below deal only with the compressed coordinates
+    def _aggAndZeroTrueTopk(self):
+        weightUpdate = torch.zeros_like(self.vs[0])
+        vs = [v[self.sketchMask] for v in self.vs]
+        w = topk(torch.sum(torch.stack(vs), dim=0), k=self.opt.k)
+        weightUpdate[self.sketchMask] = w
+        for u, v in zip(self.us, self.vs):
+            # zeroing u won't do anything if doAggregate is False
+            u[weightUpdate.nonzero()] = 0
+            v[weightUpdate.nonzero()] = 0
+        return weightUpdate
 
-    def _aggregateSketches(self):
+    def _aggAndZeroLocalTopk(self):
+        weightUpdate = torch.zeros_like(self.vs[0])
+        vs = [v[self.sketchMask] for v in self.vs]
+        assert(self.opt.p2 in [None, 0, 1])
+        localTopks = [topk(v, k=self.opt.k) for v in vs]
+        if self.opt.p2 is None or self.opt.p2 == 0:
+            # no second round of communication
+            # weightUpdate is just the sum of localTopks,
+            w = torch.sum(torch.stack(localTopks), dim=0)
+            weightUpdate[self.sketchMask] = w
+            # and each worker zeros out only what it sent
+            for u, v, ltk in zip(self.us, self.vs, localTopks):
+                # want to do v[sketchMask][ltk.nonzero()] = 0
+                # but this doesn't work since v[sketchMask] makes
+                # a copy, and then only the copy gets zeroed
+                sent = self.sketchMask.clone().float()
+                sent[self.sketchMask] *= ltk
+                # can do nonzero() since sent is size self.D
+                u[sent.nonzero()] = 0 # momentum stopping
+                v[sent.nonzero()] = 0 # reset error accumulation
+        else:
+            assert(self.opt.p2 == 1)
+            # do a second round of communication to get true
+            # values of every coord that was in any local topk
+            hhs = torch.sum(torch.stack(localTopks), dim=0).nonzero()
+            w = torch.sum(torch.stack([v[hhs] for v in vs]), dim=0)
+            # roundabout way to do weightUpdate[sketchMask][hhs] = w
+            sent = torch.zeros_like(weightUpdate[self.sketchMask])
+            sent[hhs] = w
+            weightUpdate[self.sketchMask] = sent
+            # and then zero out all weightUpdate.nonzero(),
+            # since w now contains the values from each worker
+            # for every weightUpdate.nonzero() coord
+            for u, v in zip(self.us, self.vs):
+                u[weightUpdate.nonzero()] = 0
+                v[weightUpdate.nonzero()] = 0
+        return weightUpdate
+
+    def _aggAndZeroRandomK(self):
+        weightUpdate = torch.zeros_like(self.vs[0])
+        vs = [v[self.sketchMask] for v in self.vs]
+        # we can only do this if we're compressing every coordinate
+        # main reason is sampling without replacement from an arbitrary
+        # subset of ~90M gradient coordinates takes a loong time
+        # (~5 seconds in torch or numpy)
+        assert(self.sketchMask.sum() == self.D)
+
+        # choose a random set of k coordinates and send those
+        # unfortunately currently no np.random.choice equivalent in
+        # torch and unfortunately, np.random.choice is sloooow for k<<d
+        # fortunately, python's built-in random.sample is 50x faster...
+        randomCoords = random.sample(range(self.D), self.opt.k)
+        randomCoords = torch.tensor(randomCoords, device=self.device)
+
+        # weightUpdate and v have the same size due to the assert above
+        w = torch.sum(torch.stack([v[randomCoords] for v in vs]),dim=0)
+        weightUpdate[randomCoords] = w
+        for u, v in zip(self.us, self.vs):
+            # randomCoords \in (0, D), so this is a reasonable indexing
+            u[randomCoords] = 0
+            v[randomCoords] = 0
+        return weightUpdate
+
+    def _aggAndZeroSketched(self):
         """Aggregate the sketches of each worker
 
         If p2 > 0, do a second round of communication between the
@@ -417,144 +463,83 @@ class SketchedSum:
         the values of those elements)
         """
         weightUpdate = torch.zeros_like(self.vs[0])
-        # for coords that we're not sketching, store the sum across
-        # workers directly in weightUpdate
-        nonSketchedVs = torch.stack(
-                            [self.vs[workerId][~self.sketchMask]
-                             for workerId in range(self.numWorkers)]
-                        )
-        weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs,
-                                                   dim=0)
-        if self.opt.doAccumulateError:
-            # get candidate topk, then do second round of communication
-            if self.opt.p2 > 0:
-                candidateTopk = np.sum(self.workerSketches).unSketch(
-                                    k=self.opt.p2*self.opt.k)
-                # get coords that were populated by the unSketch
-                # (i.e. the heavy hitters)
-                candidateHHCoords = candidateTopk.nonzero()
-                # get exact values for candidateHHCoords
-                candidateTopk[candidateHHCoords] = torch.sum(torch.stack(
-                    [self.vs[workerId][self.sketchMask][candidateHHCoords]
-                     for workerId in range(self.numWorkers)]
-                    ),
-                dim=0)
-                weightUpdate[self.sketchMask] = topk(candidateTopk,
-                                                     k=self.opt.k)
-                #weightUpdate[self.sketchMask = topk(sum(self.vs),
-                #                                    k=self.opt.k)
+        vs = [v[self.sketchMask] for v in self.vs]
+
+        # first, sketch vs into self.workerSketches
+        for workerId, v in enumerate(vs):
+            # zero the sketch from the previous round
+            self.workerSketches[workerId].zero()
+            if self.opt.p1 > 0:
+                # truncate and then sketch
+                tk = topk(v, self.opt.p1 * self.opt.k)
+                self.workerSketches[workerId] += tk
             else:
-                # if p2 == 0, then there's no second round of
-                # communication: we just use the values for the gradient
-                # that we got from the sketch
-                assert(self.opt.p2 == 0)
-                weightUpdate[self.sketchMask] = np.sum(
-                        self.workerSketches).unSketch(k=self.opt.k)
+                # sketch without truncating
+                self.workerSketches[workerId] += v
 
-            if False:
-                # just for debugging
-                trueWeightUpdate = topk(sum(self.vs), k=self.opt.k)
-                overlap = torch.sum((weightUpdate != 0) * (trueWeightUpdate != 0)).item()
-                print("OVERLAP:", overlap, "out of ", self.opt.k)
-                if True or overlap < 7000:
-                    ipdb.set_trace()
-                print("(nonzero WU):", weightUpdate.nonzero().size())
+        # now gather workerSketches, and do a 2nd round of communication
+        # if p2 > 0
+        if self.opt.p2 > 0:
+            candidateTopk = np.sum(self.workerSketches).unSketch(
+                                k=self.opt.p2*self.opt.k)
+            # get coords that were populated by the unSketch
+            # (i.e. the heavy hitters)
+            candidateHHCoords = candidateTopk.nonzero()
+            # get exact values for candidateHHCoords
+            candidateTopk[candidateHHCoords] = torch.sum(torch.stack(
+                    [v[candidateHHCoords] for v in vs]),
+                dim=0)
+            w = topk(candidateTopk, k=self.opt.k)
+            weightUpdate[self.sketchMask] = w
         else:
-            # no error accumulation -- gradVecs were sketched directly
-            weightUpdate = np.sum(self.workerSketches).unSketch(k=self.opt.k)
-        assert(weightUpdate is not None)
-        return weightUpdate
-
-    def _aggregateVs(self):
-        """Aggregate the error accumulation vectors directly
-
-        Used when doing the true topk instead of sketching.
-        """
-        weightUpdate = torch.zeros_like(self.vs[0])
-
-        # for coords we're not compressing, store the sum of vs
-        nonSketchedVs = torch.stack(
-                            [self.vs[workerId][~self.sketchMask]
-                             for workerId in range(self.numWorkers)]
-                        )
-        weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs, dim=0)
-
-        # for coords we are compressing, store the topk of the sum of vs
-        sketchedVs = torch.stack(
-                        [self.vs[workerId][self.sketchMask]
-                         for workerId in range(self.numWorkers)]
-                     )
-        weightUpdate[self.sketchMask] = topk(torch.sum(sketchedVs, dim=0),
-                                             k=self.opt.k)
-
-        return weightUpdate
-
-    def _aggregateTopkVs(self):
-        assert(self.opt.p2 in [0, 1])
-
-        """Aggregate the local topk of each workers' v vector"""
-        weightUpdate = torch.zeros_like(self.vs[0])
-
-        # for coords we're not compressing, store the sum of vs
-        nonSketchedVs = torch.stack(
-                            [self.vs[workerId][~self.sketchMask]
-                             for workerId in range(self.numWorkers)]
-                        )
-        weightUpdate[~self.sketchMask] = torch.sum(nonSketchedVs, dim=0)
-
-        # for coords we are compressing, store the sum of the topk of vs
-        sketchedVs = torch.stack(
-                [topk(self.vs[workerId][self.sketchMask], k=self.opt.k)
-                 for workerId in range(self.numWorkers)]
-            )
-        weightUpdate[self.sketchMask] = torch.sum(sketchedVs, dim=0)
-
-        if self.opt.p2 == 1:
-            # second round of communication
-            HHs = weightUpdate.nonzero()
-            weightUpdate[HHs] = sum([v[HHs] for v in self.vs])
-
-        else:
+            # if p2 == 0, then there's no second round of
+            # communication: we just use the values for the gradient
+            # that we got from the sketch
             assert(self.opt.p2 == 0)
-            # ALERT BAD CODE: this fragment below replaces what would
-            # normally run in backward() for non-localtopk modes
-            # but I can't do this there for local topk since after
-            # returning the weightUpdate from this function we don't
-            # know which coords of each v vector should be zeroed out
-            for u, v, sv in zip(self.us, self.vs, sketchedVs):
-                if self.opt.doAccumulateError:
-                    # zero out just the coordinates that we sent
-                    # don't zero out u for ~self.sketchMask since no nee
-                    # to stop momentum for coords sent every iteration
-                    sent = sv.nonzero()
-                    u[self.sketchMask][sent] = 0
-                    v[self.sketchMask][sent] = 0
-                    v[~self.sketchMask] = 0
-                else:
-                    v.zero_()
+            w = np.sum(self.workerSketches).unSketch(k=self.opt.k)
+            weightUpdate[self.sketchMask] = w
+
+        # zero out the coords of u, v that are being updated
+        for u, v in zip(self.us, self.vs):
+            u[weightUpdate.nonzero()] = 0
+            v[weightUpdate.nonzero()] = 0
+
+        if False:
+            # just for debugging
+            trueWeightUpdate = topk(sum(self.vs), k=self.opt.k)
+            overlap = torch.sum((weightUpdate != 0) * (trueWeightUpdate != 0)).item()
+            print("OVERLAP:", overlap, "out of ", self.opt.k)
+            print("(nonzero WU):", weightUpdate.nonzero().size())
 
         return weightUpdate
 
 
-    def _aggregateRandomVs(self):
-        # we can only do this if we're compressing every coordinate
-        # main reason is sampling without replacement from an arbitrary
-        # subset of ~90M gradient coordinates takes a loong time
-        # (~5 seconds in torch or numpy)
-        assert(self.sketchMask.sum() == self.D)
+    def _aggregateAndZeroUVs(self):
 
-        # choose a random set of k coordinates and send those
-        # unfortunately currently no np.random.choice equivalent in torch
-        # and unfortunately, np.random.choice is slooooooow for k<<d
-        # fortunately, python's built-in random.sample is 50x faster....
-        randomCoords = random.sample(range(self.D), self.opt.k)
-        randomCoords = torch.tensor(randomCoords, device=self.device)
+        # first, deal with just the compressed coordinates
+        # (delegated to helper functions)
+        if self.doTrueTopk:
+            weightUpdate = self._aggAndZeroTrueTopk()
+        elif self.doLocalTopk:
+            weightUpdate = self._aggAndZeroLocalTopk()
+        elif self.doRandomK:
+            weightUpdate = self._aggAndZeroRandomK()
+        else:
+            weightUpdate = self._aggAndZeroSketched()
 
-        weightUpdate = torch.zeros_like(self.vs[0])
-        weightUpdate[randomCoords] = torch.sum(torch.stack(
-                            [self.vs[workerId][randomCoords]
-                             for workerId in range(self.numWorkers)]
-                        ), dim=0)
+        # now deal with the non-compressed coordinates
+        vs = [v[~self.sketchMask] for v in self.vs]
+        weightUpdate[~self.sketchMask] = torch.sum(torch.stack(vs), dim=0)
+        for v in self.vs:
+            # only zero out v, not u -- we don't want to stop momentum
+            # for coords that are being updated every iteration
+            v[~self.sketchMask] = 0
+
+        # reset the error accumulation vector every time if
+        # error accumulation is turned off
+        if not self.opt.doAccumulateError:
+            for v in self.vs:
+                v.zero_()
 
         return weightUpdate
 
@@ -571,58 +556,27 @@ class SketchedSum:
         """
         if flushVs:
             assert(doAggregate)
+
         # need to save the existing gradient so we can accumulate the
         # new gradient instead of replacing the old
         initialGradVec = self._getGradVec()
 
-        # backprop on each worker updating self.us and self.vs
-        for workerId in range(self.numWorkers):
-            # if doAggregate, _backwardWorker will sketch self.vs[workerId]
-            # into self.workerSketches, so that self._aggregateSketches
-            # can aggregate them into the final weight update
-            self._backwardWorker(workerId, doAggregate)
+        # give backwardWorker a clean slate to backprop into
+        self._setGradVec(torch.zeros_like(initialGradVec))
 
+        # backprop on each worker, updating self.us and self.vs
+        for workerId in range(self.numWorkers):
+            self._backwardWorker(workerId)
+
+        # doAggregate is True when we're ready to make a step
         if doAggregate:
             if flushVs:
                 weightUpdate = sum(self.vs)
+                for u, v in zip(self.us, self.vs):
+                    u.zero_()
+                    v.zero_()
             else:
-                if self.doTrueTopk:
-                    # for true top-k, just aggregate self.vs directly
-                    weightUpdate = self._aggregateVs()
-                    #print(torch.norm(weightUpdate))
-                elif self.doLocalTopk:
-                    weightUpdate = self._aggregateTopkVs()
-                elif self.doRandomK:
-                    weightUpdate = self._aggregateRandomVs()
-                else:
-                    # for sketched top-k, aggregate the sketches
-                    weightUpdate = self._aggregateSketches()
-                    #print(torch.norm(weightUpdate))
-
-            #print(torch.stack(list(map(torch.std, self.vs))))
-            # BAD CODE ALERT -- see note in _aggregateTopkVs
-            localTopkException = self.doLocalTopk and (self.opt.p2 == 0)
-            if not localTopkException:
-                if self.opt.doAccumulateError:
-                    # zero out coordinates on each worker that the
-                    # parameter server updates
-                    hhCoords = weightUpdate.nonzero()
-                    #print("HH nonzero", hhCoords.size())
-                    for workerId in range(self.numWorkers):
-                        # the parameter server updated the heavy hitter
-                        # coords and also the coords that don't get
-                        # sketched
-                        self.us[workerId][hhCoords] = 0
-                        #self.us[workerId][~self.sketchMask] = 0
-                        self.vs[workerId][hhCoords] = 0
-                        self.vs[workerId][~self.sketchMask] = 0
-                else:
-                    # if no error accumulation, self.vs just accumulates
-                    # gradients directly until we aggregate them, at which
-                    # point each worker is completely zeroed out
-                    for workerId in range(self.numWorkers):
-                        self.vs[workerId].zero_()
-
+                weightUpdate = self._aggregateAndZeroUVs()
             # add back the initial gradient vector
             weightUpdate.add_(initialGradVec)
 
