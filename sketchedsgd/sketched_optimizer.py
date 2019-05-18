@@ -369,9 +369,11 @@ class SketchedSum:
                          self._getParamVec())
         # multiply by learning rate before doing momentum
         # & error accumulation
-        lrVec = self._getLRVec()
-        #print("LR:", lrVec)
-        gradVec *= lrVec
+
+        # [MOMENTUM_TYPE] this is the way pytorch *doesn't* do momentum
+        # instead, torch.nn.SGD multiples v by the LR instead of g
+        #lrVec = self._getLRVec()
+        #gradVec *= lrVec
 
         if self.opt.doAccumulateError:
             self.us[workerId].mul_(self.opt.momentum).add_(gradVec)
@@ -386,7 +388,7 @@ class SketchedSum:
         w = topk(torch.sum(torch.stack(vs), dim=0), k=self.opt.k)
         weightUpdate[self.sketchMask] = w
         for u, v in zip(self.us, self.vs):
-            # zeroing u won't do anything if doAggregate is False
+            # zeroing u won't do anything if accumulateError is False
             u[weightUpdate.nonzero()] = 0
             v[weightUpdate.nonzero()] = 0
         return weightUpdate
@@ -580,7 +582,11 @@ class SketchedSum:
             # add back the initial gradient vector
             weightUpdate.add_(initialGradVec)
 
-            self._setGradVec(weightUpdate)
+            # [MOMENTUM_TYPE] This *is* how torch.optim.SGD does momentum.
+            # To multiply g by LR instead of v, swap commented lines below
+            # and see other MOMENTUM_TYPE comment
+            #self._setGradVec(weightUpdate)
+            self._setGradVec(weightUpdate * self._getLRVec())
         else:
             # if we're not aggregating, then put back the initialGradVec
             # (since self._backwardWorker may have modified it)
