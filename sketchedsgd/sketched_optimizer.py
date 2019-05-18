@@ -343,7 +343,7 @@ class SketchedSum:
         for i in range(self.numWorkers):
             start = i * batchSize // self.numWorkers
             end = (i + 1) * batchSize // self.numWorkers
-            self.losses.append(loss[start:end].sum() / self.numWorkers)
+            self.losses.append(loss[start:end].sum())
         return self
 
     def _backwardWorker(self, workerId):
