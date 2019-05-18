@@ -464,7 +464,6 @@ class SketchedSum:
         estimate of the topk (both which elements are in the topk and
         the values of those elements)
         """
-        weightUpdate = torch.zeros_like(self.vs[0])
         vs = [v[self.sketchMask] for v in self.vs]
 
         # first, sketch vs into self.workerSketches
@@ -491,7 +490,10 @@ class SketchedSum:
             candidateTopk[candidateHHCoords] = torch.sum(torch.stack(
                     [v[candidateHHCoords] for v in vs]),
                 dim=0)
+            del vs
             w = topk(candidateTopk, k=self.opt.k)
+            del candidateTopk
+            weightUpdate = torch.zeros_like(self.vs[0])
             weightUpdate[self.sketchMask] = w
         else:
             # if p2 == 0, then there's no second round of
@@ -499,6 +501,7 @@ class SketchedSum:
             # that we got from the sketch
             assert(self.opt.p2 == 0)
             w = np.sum(self.workerSketches).unSketch(k=self.opt.k)
+            weightUpdate = torch.zeros_like(self.vs[0])
             weightUpdate[self.sketchMask] = w
 
         # zero out the coords of u, v that are being updated
