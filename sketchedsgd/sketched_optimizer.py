@@ -122,17 +122,17 @@ class SketchedModel:
     # doesn't actually add "model" to self.__dict__ -- instead, nn.Module
     # creates a key/value pair in some internal dictionary that keeps
     # track of submodules
-    def __init__(self, model, sketchBiases=False):
+    def __init__(self, model, sketchBiases=False, sketchParamsLargerThan=0):
         self.model = model
-        # sketch everything by default
+        # sketch everything larger than sketchParamsLargerThan
         for p in model.parameters():
-            p.do_sketching = True
+            p.do_sketching = p.numel() >= sketchParamsLargerThan
 
-        if not sketchBiases:
-            for m in model.modules():
-                if isinstance(m, torch.nn.Linear):
-                    m.weight.do_sketching = True
-                    m.bias.do_sketching = False
+        # override bias terms with whatever sketchBiases is
+        for m in model.modules():
+            if isinstance(m, torch.nn.Linear):
+                if m.bias is not None:
+                    m.bias.do_sketching = sketchBiases
 
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
