@@ -394,10 +394,10 @@ class SketchedSum:
         return weightUpdate
 
     def _aggAndZeroLocalTopk(self):
-        weightUpdate = torch.zeros_like(self.vs[0])
-        vs = [v[self.sketchMask] for v in self.vs]
         assert(self.opt.p2 in [None, 0, 1])
-        localTopks = [topk(v, k=self.opt.k) for v in vs]
+        localTopks = [topk(v[self.sketchMask], k=self.opt.k)
+                      for v in self.vs]
+        weightUpdate = torch.zeros_like(self.vs[0])
         if self.opt.p2 is None or self.opt.p2 == 0:
             # no second round of communication
             # weightUpdate is just the sum of localTopks,
@@ -418,7 +418,8 @@ class SketchedSum:
             # do a second round of communication to get true
             # values of every coord that was in any local topk
             hhs = torch.sum(torch.stack(localTopks), dim=0).nonzero()
-            w = torch.sum(torch.stack([v[hhs] for v in vs]), dim=0)
+            w = torch.sum(torch.stack([v[self.sketchMask][hhs]
+                                       for v in self.vs]), dim=0)
             # roundabout way to do weightUpdate[sketchMask][hhs] = w
             sent = torch.zeros_like(weightUpdate[self.sketchMask])
             sent[hhs] = w
@@ -588,8 +589,9 @@ class SketchedSum:
             # [MOMENTUM_TYPE] This *is* how torch.optim.SGD does momentum.
             # To multiply g by LR instead of v, swap commented lines below
             # and see other MOMENTUM_TYPE comment
-            #self._setGradVec(weightUpdate)
             self._setGradVec(weightUpdate * self._getLRVec())
+            # use the line below to multiply g by LR instead of v
+            #self._setGradVec(weightUpdate)
         else:
             # if we're not aggregating, then put back the initialGradVec
             # (since self._backwardWorker may have modified it)
