@@ -394,7 +394,6 @@ class SketchedSum:
         return weightUpdate
 
     def _aggAndZeroLocalTopk(self):
-        assert(self.opt.p2 in [None, 0, 1])
         localTopks = [topk(v[self.sketchMask], k=self.opt.k)
                       for v in self.vs]
         weightUpdate = torch.zeros_like(self.vs[0])
@@ -414,10 +413,19 @@ class SketchedSum:
                 u[sent.nonzero()] = 0 # momentum stopping
                 v[sent.nonzero()] = 0 # reset error accumulation
         else:
-            assert(self.opt.p2 == 1)
+            # do a second round of communication
+
+            # doesn't make sense to request more than Wk coordinates
+            # in the second round of communication, since the PS would
+            # just have to choose the additional coords at random
+            assert(self.opt.p2 <= self.numWorkers)
             # do a second round of communication to get true
-            # values of every coord that was in any local topk
-            hhs = torch.sum(torch.stack(localTopks), dim=0).nonzero()
+            # values of the top k*p2 coords among those that were
+            # sent from any worker
+            hhs = torch.sum(torch.stack(localTopks), dim=0)
+            hhs = topk(hhs, self.opt.p2*self.opt.k).nonzero()
+            #for workerId in range(self.numWorkers):
+            #    print("WORKER {} LTK: ".format(workerId), localTopks[workerId])
             w = torch.sum(torch.stack([v[self.sketchMask][hhs]
                                        for v in self.vs]), dim=0)
             # roundabout way to do weightUpdate[sketchMask][hhs] = w
