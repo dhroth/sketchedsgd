@@ -423,6 +423,7 @@ class SketchedSum:
             # values of the top k*p2 coords among those that were
             # sent from any worker
             hhs = torch.sum(torch.stack(localTopks), dim=0)
+            del localTopks
             hhs = topk(hhs, self.opt.p2*self.opt.k).nonzero()
             #for workerId in range(self.numWorkers):
             #    print("WORKER {} LTK: ".format(workerId), localTopks[workerId])
