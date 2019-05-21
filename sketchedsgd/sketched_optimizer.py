@@ -442,28 +442,55 @@ class SketchedSum:
         return weightUpdate
 
     def _aggAndZeroRandomK(self):
-        weightUpdate = torch.zeros_like(self.vs[0])
-        vs = [v[self.sketchMask] for v in self.vs]
-        # we can only do this if we're compressing every coordinate
-        # main reason is sampling without replacement from an arbitrary
+        # instead of sampling k elements, sample k + # uncompressed
+        # do this because ideally we'd send all the uncompressed ones
+        # plus k of the compressed ones. But we can't sample from only
+        # the uncompressed ones (see comment below), so we sample from
+        # all of them, which could theoretically lead us to send as few
+        # as k - # uncompressed if we happen to choose all the uncompressed
+        # coords. So instead, be conservative and sample k + # uncompressed
+        numCoords = self.opt.k + (~self.sketchMask).nonzero().numel()
+
+        # choose a random set of numCoords coordinates and send those
+        # unfortunately, sampling without replacement (using torch,
+        # np, or python's built-in random) takes several seconds for
+        # typical inputs. So instead, sample slightly more than k coords,
+        # and then choose the unique ones. How many is "slightly" more?
+        # compute the expected number of unique elements E_k when drawing
+        # k' from [1..D]. Then solve for k', setting E_k=numCoords.
+        # this is a bit ridiculous, but it's 1000x faster than
+        # the alternatives...
+        # Note: we won't get exactly numCoords unique draws, but it's
+        # pretty close, and we're already fudging it with the
+        # non-compressed coords (see below)
+        # Note2: we should do torch.unique here, but we have to
+        # do torch.unique below anyway, so no point doing it twice
+        nSamples = np.log(1-numCoords/self.D) / np.log((self.D-1)/self.D)
+        nSamples = int(nSamples)
+        randomCoords = torch.randint(int(self.D),
+                                     size=(nSamples,),
+                                     device=self.device)
+
+        # ideally, we would've sampled from self.sketchMask.nonzero(). But
+        # sampling without replacement from an arbitrary
         # subset of ~90M gradient coordinates takes a loong time
         # (~5 seconds in torch or numpy)
-        assert(self.sketchMask.sum() == self.D)
+        # so instead, we sampled from [0..D-1], and now we just force that
+        # all non-compressed coordinates are included
+        uncompressedCoords = (~self.sketchMask).nonzero().view(-1)
+        toSend = torch.cat((randomCoords, uncompressedCoords))
+        # we might have sampled an uncompressed coord, so take unique elems
+        # this is fast as long as it's on the GPU (~150x faster than CPU)
+        toSend = torch.unique(toSend)
 
-        # choose a random set of k coordinates and send those
-        # unfortunately currently no np.random.choice equivalent in
-        # torch and unfortunately, np.random.choice is sloooow for k<<d
-        # fortunately, python's built-in random.sample is 50x faster...
-        randomCoords = random.sample(range(self.D), self.opt.k)
-        randomCoords = torch.tensor(randomCoords, device=self.device)
-
-        # weightUpdate and v have the same size due to the assert above
-        w = torch.sum(torch.stack([v[randomCoords] for v in vs]),dim=0)
-        weightUpdate[randomCoords] = w
+        w = torch.sum(torch.stack([v[toSend] for v in self.vs]), dim=0)
+        weightUpdate = torch.zeros_like(self.vs[0])
+        weightUpdate[toSend] = w
         for u, v in zip(self.us, self.vs):
-            # randomCoords \in (0, D), so this is a reasonable indexing
-            u[randomCoords] = 0
-            v[randomCoords] = 0
+            # toSend \in (0, D), so this is a reasonable indexing
+            u[toSend] = 0
+            v[toSend] = 0
+
         return weightUpdate
 
     def _aggAndZeroSketched(self):
@@ -543,6 +570,8 @@ class SketchedSum:
             weightUpdate = self._aggAndZeroSketched()
 
         # now deal with the non-compressed coordinates
+        # Note: this is a no-op if doRandomK=True, since we dealt
+        # with the uncompressed coords already in self._aggAndZeroRandomK()
         vs = [v[~self.sketchMask] for v in self.vs]
         weightUpdate[~self.sketchMask] = torch.sum(torch.stack(vs), dim=0)
         for v in self.vs:
