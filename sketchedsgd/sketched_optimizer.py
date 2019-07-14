@@ -394,16 +394,15 @@ class SketchedSum:
         return weightUpdate
 
     def _aggAndZeroLocalTopk(self):
-        localTopks = [topk(v[self.sketchMask], k=self.opt.k)
-                      for v in self.vs]
         weightUpdate = torch.zeros_like(self.vs[0])
         if self.opt.p2 is None or self.opt.p2 == 0:
-            # no second round of communication
-            # weightUpdate is just the sum of localTopks,
-            w = torch.sum(torch.stack(localTopks), dim=0)
-            weightUpdate[self.sketchMask] = w
-            # and each worker zeros out only what it sent
-            for u, v, ltk in zip(self.us, self.vs, localTopks):
+            for u, v in zip(self.us, self.vs):
+                ltk = topk(v, k=self.opt.k)
+                # no second round of communication
+                # weightUpdate is just the sum of localTopks,
+                weightUpdate[self.sketchMask] += ltk
+                # and each worker zeros out only what it sent
+
                 # want to do v[sketchMask][ltk.nonzero()] = 0
                 # but this doesn't work since v[sketchMask] makes
                 # a copy, and then only the copy gets zeroed
@@ -413,6 +412,8 @@ class SketchedSum:
                 u[sent.nonzero()] = 0 # momentum stopping
                 v[sent.nonzero()] = 0 # reset error accumulation
         else:
+            localTopks = [topk(v[self.sketchMask], k=self.opt.k)
+                          for v in self.vs]
             # do a second round of communication
 
             # doesn't make sense to request more than Wk coordinates
@@ -501,7 +502,10 @@ class SketchedSum:
         estimate of the topk (both which elements are in the topk and
         the values of those elements)
         """
-        vs = [v[self.sketchMask] for v in self.vs]
+        if self.sketchMask.sum() < self.vs[0].numel():
+            vs = [v[self.sketchMask] for v in self.vs]
+        else:
+            vs = self.vs
 
         # first, sketch vs into self.workerSketches
         for workerId, v in enumerate(vs):
@@ -524,9 +528,8 @@ class SketchedSum:
             # (i.e. the heavy hitters)
             candidateHHCoords = candidateTopk.nonzero()
             # get exact values for candidateHHCoords
-            candidateTopk[candidateHHCoords] = torch.sum(torch.stack(
-                    [v[candidateHHCoords] for v in vs]),
-                dim=0)
+            for v in vs:
+                candidateTopk[candidateHHCoords] += v[candidateHHCoords]
             del vs
             w = topk(candidateTopk, k=self.opt.k)
             del candidateTopk
