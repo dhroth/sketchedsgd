@@ -639,6 +639,10 @@ class SketchedSum:
             # (since self._backwardWorker may have modified it)
             self._setGradVec(initialGradVec)
 
+        # return the number of parameters that get updated, so whoever
+        # called us knows how much communication happened
+        return weightUpdate.nonzero().numel()
+
 
     def item(self):
         """Return the value of the loss"""
