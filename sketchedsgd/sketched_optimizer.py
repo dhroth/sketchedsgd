@@ -367,11 +367,12 @@ class SketchedSum:
         if self.opt.weight_decay != 0:
             gradVec.add_(self.opt.weight_decay / self.numWorkers,
                          self._getParamVec())
-        # multiply by learning rate before doing momentum
-        # & error accumulation
 
-        # [MOMENTUM_TYPE] this is the way pytorch *doesn't* do momentum
-        # instead, torch.nn.SGD multiples v by the LR instead of g
+        # [MOMENTUM_TYPE] this is the way Karimireddy+2019 ("error feedback
+        # fixed signSGD...") combine error feedback with the LR.
+        # In pytorch, on the other hand, torch.nn.SGD multiples v,
+        # not g by the LR. To use the pytorch method, uncomment these
+        # two lines and see the other MOMENTUM_TYPE comment.
         #lrVec = self._getLRVec()
         #gradVec *= lrVec
 
@@ -627,11 +628,11 @@ class SketchedSum:
             # add back the initial gradient vector
             weightUpdate.add_(initialGradVec)
 
-            # [MOMENTUM_TYPE] This *is* how torch.optim.SGD does momentum.
-            # To multiply g by LR instead of v, swap commented lines below
-            # and see other MOMENTUM_TYPE comment
+            # [MOMENTUM_TYPE] This is how torch.optim.SGD does momentum
+            # (different from Karimireddy+2019).
+            # To use Karimireddy+2019's method instead, swap commented
+            # lines below and see other MOMENTUM_TYPE comment
             self._setGradVec(weightUpdate * self._getLRVec())
-            # use the line below to multiply g by LR instead of v
             #self._setGradVec(weightUpdate)
         else:
             # if we're not aggregating, then put back the initialGradVec
