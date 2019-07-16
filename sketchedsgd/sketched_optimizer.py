@@ -495,6 +495,37 @@ class SketchedSum:
 
         return weightUpdate
 
+    def _sketchHelper(self, vs):
+        # sketch vs into self.workerSketches
+        # this method does it the proper way, by sketching each
+        # v into the corresponding sketch
+        for workerId, v in enumerate(vs):
+            # zero the sketch from the previous round
+            self.workerSketches[workerId].zero()
+            if self.opt.p1 > 0:
+                # truncate and then sketch
+                tk = topk(v, self.opt.p1 * self.opt.k)
+                self.workerSketches[workerId] += tk
+            else:
+                # sketch without truncating
+                self.workerSketches[workerId] += v
+
+    def _sketchHelperShortcut(self, vs):
+        # sketch the sum of vs into self.workerSketches[0]
+        # this produces the same output as sketching each of the
+        # numWorkers v vectors into the corresponding sketch, and then
+        # summing the sketches. But you only have to sketch a single
+        # vector (doing this is only possible in the simulated
+        # distributed environment)
+        for workerId in range(self.numWorkers):
+            self.workerSketches[workerId].zero()
+        if self.opt.p1 > 0:
+            # truncate each vector
+            summed = sum([topk(v, self.opt.p1 * self.opt.k) for v in vs])
+        else:
+            summed = sum(vs)
+        self.workerSketches[0] += summed
+
     def _aggAndZeroSketched(self):
         """Aggregate the sketches of each worker
 
@@ -508,17 +539,12 @@ class SketchedSum:
         else:
             vs = self.vs
 
-        # first, sketch vs into self.workerSketches
-        for workerId, v in enumerate(vs):
-            # zero the sketch from the previous round
-            self.workerSketches[workerId].zero()
-            if self.opt.p1 > 0:
-                # truncate and then sketch
-                tk = topk(v, self.opt.p1 * self.opt.k)
-                self.workerSketches[workerId] += tk
-            else:
-                # sketch without truncating
-                self.workerSketches[workerId] += v
+        # caller can turn on using the slow version for testing
+        # purposes by setting self._doSlowSketching = True
+        if self._doSlowSketching is not None and self._doSlowSketching:
+            self._sketchHelper(vs)
+        else:
+            self._sketchHelperShortcut(vs)
 
         # now gather workerSketches, and do a 2nd round of communication
         # if p2 > 0
