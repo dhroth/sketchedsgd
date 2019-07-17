@@ -240,7 +240,7 @@ class SketchedSum:
             # elements that we're going to sketch, i.e. sketchMask.sum()
             self.workerSketches = [CSVec(d=self.sketchMask.sum().item(),
                                          c=c, r=r,
-                                         device=self.device, nChunks=1,
+                                         device=self.device,
                                          numBlocks=numBlocks)
                                    for _ in range(numWorkers)]
         else:
