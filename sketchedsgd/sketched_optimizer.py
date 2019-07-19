@@ -198,6 +198,10 @@ class SketchedSum:
         self.doLocalTopk = doLocalTopk
         self.doRandomK = doRandomK
         self.doSketching = not (doTrueTopk or doLocalTopk or doRandomK)
+
+        # used for debugging
+        self._doSlowSketching = False
+
         # self.modelDevice is not tested... not sure what happens if
         # the model is on the CPU
         if opt.param_groups[0]["params"][0].is_cuda:
