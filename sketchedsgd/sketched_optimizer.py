@@ -208,7 +208,7 @@ class SketchedSum:
             self.modelDevice = "cuda"
         else:
             self.modelDevice = "cpu"
-        self.device = "cuda"
+        self.device = self.modelDevice
         print("device", self.device)
 
         D = 0
