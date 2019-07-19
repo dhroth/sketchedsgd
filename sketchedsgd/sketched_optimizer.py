@@ -559,6 +559,7 @@ class SketchedSum:
             # (i.e. the heavy hitters)
             candidateHHCoords = candidateTopk.nonzero()
             # get exact values for candidateHHCoords
+            candidateTopk.zero_()
             for v in vs:
                 candidateTopk[candidateHHCoords] += v[candidateHHCoords]
             del vs
