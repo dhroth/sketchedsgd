@@ -1,7 +1,7 @@
 # Sketched SGD
 
 ## Installation
-Dependencies: `pytorch` and `numpy`. Tested with `torch==1.0.1` and `numpy==1.15.3`, but this should work with a wide range of versions.
+Dependencies: `pytorch`, `numpy`, and `csvec` (https://github.com/nikitaivkin/csh). Tested with `torch==1.0.1` and `numpy==1.15.3`, but this should work with a range of versions.
 
 `git clone` the repository to your local machine, move to the directory containing `setup.py`, then run
 ```
