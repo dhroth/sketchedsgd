@@ -31,10 +31,15 @@ def checkW(model, expectedWs):
     assert(inExpected, msg.format(w, *expectedWs))
 
 def runTest(nData, nWeights, nWorkers, k, r, c, p2,
-            expectedW1s, expectedW2s, device):
+            expectedW1s, expectedW2s, device, doSlowSketching):
 
     model, opt, summer = makeSketchers(nWeights, nWorkers, k, r, c, p2,
                                        device)
+
+    # setting this flag to True uses a faster sketching calculation
+    # that would be cheating in the real distributed setting
+    summer._doSlowSketching = doSlowSketching
+
     X, y = makeData(nData, nWeights, device)
 
     loss = summer((y - model(X))**2)
@@ -156,7 +161,7 @@ Two Parameters:
 """
 
 testParams = [
-#    N, d, W, k, r, c,    p2, expectedW1,      expectedW2
+#    N, d, W, k, r, c,    p2, expectedW1s,     expectedW2s
     (4, 1, 1, 1, 1, 1,    0,  ([0.14],),       ([0.3808],)),
     (4, 1, 2, 1, 1, 1,    0,  ([0.14],),       ([0.3808],)),
     (4, 2, 1, 2, 9, 1000, 0,  ([0.28, 0.34],), ([0.172, 0.204],)),
@@ -169,11 +174,12 @@ testParams = [
 ]
 
 def testAll():
-    for device in ["cpu", "cuda"]:
-        for N, d, W, k, r, c, p2, expectedW1s, expectedW2s in testParams:
-            expectedW1s = tuple(torch.tensor(w) for w in expectedW1s)
-            if expectedW2s is not None:
-                expectedW2s = tuple(torch.tensor(w) for w in expectedW2s)
-            for test in runTest(N, d, W, k, r, c, p2,
-                                expectedW1s, expectedW2s, device):
-                yield test
+    for doSlowSketching in [False, True]:
+        for device in ["cpu", "cuda"]:
+            for N, d, W, k, r, c, p2, w1s, w2s in testParams:
+                w1s = tuple(torch.tensor(w) for w in w1s)
+                if w2s is not None:
+                    w2s = tuple(torch.tensor(w) for w in w2s)
+                for test in runTest(N, d, W, k, r, c, p2, w1s, w2s,
+                                    device, doSlowSketching):
+                    yield test
