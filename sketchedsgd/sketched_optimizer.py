@@ -139,8 +139,9 @@ class SketchedModel:
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
-    #Fix to avoid infinite loop in __getattr__
-    #Otherwise RecursionError: maximum recursion depth exceeded while calling a Python object
+    # Fix to avoid infinite loop in __getattr__
+    # Otherwise RecursionError: maximum recursion depth exceeded while
+    # calling a Python object
     def __getattr__(self, name):
         if name == "__setstate__":
             raise AttributeError(name)
