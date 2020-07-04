@@ -57,7 +57,8 @@ class SketchedSGD(torch.optim.Optimizer):
     momentum, and weight decay, so we don't want the user's optim.SGD
     instance to apply them a second time.
     """
-    def __init__(self, opt, k, accumulateError=True, p1=0, p2=0):
+    def __init__(self, opt, k, accumulateError=True, p1=0, p2=0,
+                 transferHalf=False):
         """SketchedSGD Constructor
 
         Args:
@@ -91,6 +92,7 @@ class SketchedSGD(torch.optim.Optimizer):
         self.doAccumulateError = accumulateError
         self.p1 = p1
         self.p2 = p2
+        self.doTransferHalf = transferHalf
 
     def zero_grad(self):
         """Zero out the gradient"""
@@ -551,18 +553,33 @@ class SketchedSum:
 
         # now gather workerSketches, and do a 2nd round of communication
         # if p2 > 0
+        if self.opt.doTransferHalf:
+            # convert to half, sum them, convert back to float
+            for S in self.workerSketches:
+                S.half_()
+            summedSketch = np.sum(self.workerSketches)
+            summedSketch.float_()
+            for S in self.workerSketches:
+                S.float_()
+        else:
+            summedSketch = np.sum(self.workerSketches)
         if self.opt.p2 > 0:
-            candidateTopk = np.sum(self.workerSketches).unSketch(
-                                k=self.opt.p2*self.opt.k)
+            candidateTopk = summedSketch.unSketch(k=self.opt.p2*self.opt.k)
             # get coords that were populated by the unSketch
             # (i.e. the heavy hitters)
             candidateHHCoords = candidateTopk.nonzero()
             # get exact values for candidateHHCoords
-            candidateTopk.zero_()
+            #candidateTopk.zero_()
+            candidateTopk = torch.zeros_like(candidateTopk)
+            if self.opt.doTransferHalf:
+                candidateTopk.half_()
             for v in vs:
-                candidateTopk[candidateHHCoords] += v[candidateHHCoords]
+                toTransfer = v[candidateHHCoords]
+                if self.opt.doTransferHalf:
+                    toTransfer.half_()
+                candidateTopk[candidateHHCoords] += toTransfer
             del vs
-            w = topk(candidateTopk, k=self.opt.k)
+            w = topk(candidateTopk.float(), k=self.opt.k)
             del candidateTopk
             weightUpdate = torch.zeros_like(self.vs[0])
             weightUpdate[self.sketchMask] = w
@@ -571,7 +588,7 @@ class SketchedSum:
             # communication: we just use the values for the gradient
             # that we got from the sketch
             assert(self.opt.p2 == 0)
-            w = np.sum(self.workerSketches).unSketch(k=self.opt.k)
+            w = summedSketch.unSketch(k=self.opt.k)
             weightUpdate = torch.zeros_like(self.vs[0])
             weightUpdate[self.sketchMask] = w
 
