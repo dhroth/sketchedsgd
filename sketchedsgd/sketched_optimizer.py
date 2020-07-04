@@ -231,7 +231,7 @@ class SketchedSum:
         # a mask indicating which gradient elements we should sketch
         # and which we should send without compression (e.g. bias terms,
         # maybe early layers, etc.)
-        self.sketchMask = torch.cat(sketchMask).byte().to(self.device)
+        self.sketchMask = torch.cat(sketchMask).bool().to(self.device)
 
         print("D: {}".format(D))
         print("sketchMask.sum(): {}".format(self.sketchMask.sum()))
@@ -417,7 +417,13 @@ class SketchedSum:
         # implements
         # https://authors.library.caltech.edu/94178/1/1810.05291.pdf
 
-        assert(not self.opt.doAccumulateError)
+        if self.opt.doAccumulateError:
+            raise ValueError("don't currently support signum with "
+                             "error accumulation (shouldn't be hard "
+                             "to implement though)")
+        if self.opt.p2 is not None and self.opt.p2 > 0:
+            raise ValueError("don't currently support signum with "
+                             "a second round of communication.")
 
         # when sending vectors, we only get 1 bit, so not allowed to
         # send 0. But torch.sign(0) = 0, so need to eliminate those 0s
@@ -436,6 +442,9 @@ class SketchedSum:
 
     # the helper functions below deal only with the compressed coordinates
     def _aggAndZeroTrueTopk(self):
+        if self.opt.p2 is not None and self.opt.p2 > 0:
+            raise ValueError("Second round of communication doesn't "
+                             "make sense for true top-k. Set p2=0 or None")
         weightUpdate = torch.zeros_like(self.vs[0])
         vs = [v[self.sketchMask] for v in self.vs]
         w = topk(torch.sum(torch.stack(vs), dim=0), k=self.opt.k)
@@ -497,6 +506,9 @@ class SketchedSum:
         return weightUpdate
 
     def _aggAndZeroRandomK(self):
+        if self.opt.p2 is not None or self.opt.p2 > 0:
+            raise ValueError("Second round of communication doesn't "
+                             "make sense for random-k. Set p2=0 or None")
         # instead of sampling k elements, sample k + # uncompressed
         # do this because ideally we'd send all the uncompressed ones
         # plus k of the compressed ones. But we can't sample from only
