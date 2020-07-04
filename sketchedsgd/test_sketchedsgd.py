@@ -28,7 +28,7 @@ def checkW(model, expectedWs):
             inExpected = True
     msg = "Got w={}, expected one of ("
     msg += ",".join(["{}" for _ in expectedWs])
-    assert(inExpected, msg.format(w, *expectedWs))
+    assert inExpected, msg.format(w, *expectedWs)
 
 def runTest(nData, nWeights, nWorkers, k, r, c, p2,
             expectedW1s, expectedW2s, device, doSlowSketching):
