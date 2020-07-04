@@ -371,8 +371,7 @@ class SketchedSum:
         gradVec = self._getGradVec().to(self.device)
         # do weight decay right away
         # divide by num_workers because the gradient is
-        # summed on master instead of averaged (and the
-        # loss above is divided by num_workers)
+        # summed on master instead of averaged
         if self.opt.weight_decay != 0:
             gradVec.add_(self.opt.weight_decay / self.numWorkers,
                          self._getParamVec())
@@ -442,7 +441,8 @@ class SketchedSum:
         w = topk(torch.sum(torch.stack(vs), dim=0), k=self.opt.k)
         weightUpdate[self.sketchMask] = w
         for u, v in zip(self.us, self.vs):
-            # zeroing u won't do anything if accumulateError is False
+            # zeroing u won't do anything if accumulateError is False,
+            # as desired
             u[weightUpdate.nonzero()] = 0
             v[weightUpdate.nonzero()] = 0
         return weightUpdate
