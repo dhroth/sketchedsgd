@@ -508,10 +508,10 @@ class SketchedSum:
             if self.opt.p1 > 0:
                 # truncate and then sketch
                 tk = topk(v, self.opt.p1 * self.opt.k)
-                self.workerSketches[workerId] += tk
+                self.workerSketches[workerId].accumulateVec(tk)
             else:
                 # sketch without truncating
-                self.workerSketches[workerId] += v
+                self.workerSketches[workerId].accumulateVec(v)
 
     def _sketchHelperShortcut(self, vs):
         # sketch the sum of vs into self.workerSketches[0]
@@ -527,7 +527,7 @@ class SketchedSum:
             summed = sum([topk(v, self.opt.p1 * self.opt.k) for v in vs])
         else:
             summed = sum(vs)
-        self.workerSketches[0] += summed
+        self.workerSketches[0].accumulateVec(summed)
 
     def _aggAndZeroSketched(self):
         """Aggregate the sketches of each worker
