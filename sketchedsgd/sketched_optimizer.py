@@ -66,7 +66,8 @@ class SketchedSGD(torch.optim.Optimizer):
                  sketching
             k: how many gradient elements to extract from the sketches
             accumulateError: whether or not to accumulate error in the
-                             workers
+                             workers. Currently accumulateError=False
+                             works only if using signum
             p1: truncate worker gradients to p1*k before sketching. If
                 zero, don't truncate
             p2: the parameter server extracts p2*k heavy hitters from
@@ -166,8 +167,8 @@ class SketchedSum:
     and extracting the topk values of the summed sketch, possibly with a
     second round of communication between the workers and parameter server.
     """
-    def __init__(self, opt, c, r, numWorkers, numBlocks=1,
-                 doTrueTopk=False, doLocalTopk=False, doRandomK=False):
+    def __init__(self, opt, c, r, numWorkers,
+                 numBlocks=1, method="sketch"):
         """SketchedSum constructor
 
         Args:
@@ -179,12 +180,16 @@ class SketchedSum:
                         computation among
             numBlocks: memory optimization for the sketch (higher means
                        less memory used, but randomness becomes correlated)
-            doTrueTopk: instead of sketching, compute the true topk
-                        of the sum of the workers' gradients
-            doLocalTopk: instead of sketching, send and then sum the local
-                         topk of each worker's v vector
-            doRandomK: instead of sketching, send a random set of
-                       k coordinates
+            method: which communication protocol to use. Options:
+                sketch: send a sketch of the v vectors
+                trueTopk: send the whole v vector and use the topk of
+                          the sum of vs over workers as the weight update
+                localTopk: send and then sum the local topk of each
+                           worker's v vector
+                randomK: send a random set of k coordinates
+                signum: signSGD with majority vote
+                Pkk: send local top-Pk, of which topk is used as the
+                     weight update
         """
         self.opt = opt
         self.c = c
@@ -192,13 +197,12 @@ class SketchedSum:
         self.numWorkers = numWorkers
         # at most one of true topk, local topk, and random k allowed
         # (what can I say -- I don't believe in implicit casting?)
-        assert(((1 if doTrueTopk else 0) +
-                (1 if doLocalTopk else 0) +
-                (1 if doRandomK else 0)) <= 1)
-        self.doTrueTopk = doTrueTopk
-        self.doLocalTopk = doLocalTopk
-        self.doRandomK = doRandomK
-        self.doSketching = not (doTrueTopk or doLocalTopk or doRandomK)
+        methods = ["sketch", "trueTopk", "localTopk", "randomK",
+                   "signum", "Pkk"]
+        if method not in methods:
+            msg = "Invalid method {}. Valid options are {}"
+            raise ValueError(msg.format(method, ",".join(methods)))
+        self.method = method
 
         # used for debugging
         self._doSlowSketching = False
@@ -239,7 +243,7 @@ class SketchedSum:
                    for _ in range(numWorkers)]
 
         # don't need sketches for true/local/random topk
-        if self.doSketching:
+        if self.method == "sketch":
             print("making sketches")
             # dimensionality of the sketch (d) is the number of gradient
             # elements that we're going to sketch, i.e. sketchMask.sum()
@@ -381,11 +385,55 @@ class SketchedSum:
         #lrVec = self._getLRVec()
         #gradVec *= lrVec
 
-        if self.opt.doAccumulateError:
-            self.us[workerId].mul_(self.opt.momentum).add_(gradVec)
-            self.vs[workerId] += self.us[workerId]
-        else:
-            self.vs[workerId] += gradVec
+        self.us[workerId].mul_(self.opt.momentum).add_(gradVec)
+        self.vs[workerId] += self.us[workerId]
+
+    def _aggAndZeroPkk(self):
+        if self.opt.p2 == 0:
+            raise ValueError("Must use p2>0 for method Pkk")
+
+        # first, each worker sends local top-Pk
+        weightUpdate = torch.zeros_like(self.vs[0])
+        ltPk = [topk(v[self.sketchMask], k=self.opt.k * self.opt.p2)
+                for v in self.vs]
+        sumOfTopPks = torch.sum(torch.stack(ltPk), dim=0)
+
+        # then we get the topk of the sum of the local top-Pk
+        hhs = topk(sumOfTopPks, k=self.opt.k).nonzero()
+
+        # the weight update is the exact value of sum(v) for the top-k
+        # coordinates, and zero everywhere else
+        w = torch.sum(torch.stack([v[self.sketchMask][hhs]
+                                   for v in self.vs]), dim=0)
+        sent = torch.zeros_like(weightUpdate[self.sketchMask])
+        sent[hhs] = w
+        weightUpdate[self.sketchMask] = sent
+        for u, v in zip(self.us, self.vs):
+            u[weightUpdate.nonzero()] = 0
+            v[weightUpdate.nonzero()] = 0
+        return weightUpdate
+
+
+    def _aggAndZeroSignum(self):
+        # implements
+        # https://authors.library.caltech.edu/94178/1/1810.05291.pdf
+
+        assert(not self.opt.doAccumulateError)
+
+        # when sending vectors, we only get 1 bit, so not allowed to
+        # send 0. But torch.sign(0) = 0, so need to eliminate those 0s
+        def removeZeros(signs):
+            r = (torch.randint_like(signs, 2).float() - 0.5) * 2
+            return torch.where(signs == 0, r, signs)
+
+        # get the sign of the momentum vector
+        signs = removeZeros(torch.sign(torch.stack(self.vs)))
+
+        weightUpdate = removeZeros(torch.sign(torch.sum(signs, dim=0)))
+
+        # don't need to update us or vs, since no error accumulation
+
+        return weightUpdate
 
     # the helper functions below deal only with the compressed coordinates
     def _aggAndZeroTrueTopk(self):
@@ -608,20 +656,25 @@ class SketchedSum:
 
 
     def _aggregateAndZeroUVs(self):
-
         # first, deal with just the compressed coordinates
         # (delegated to helper functions)
-        if self.doTrueTopk:
+        if self.method == "trueTopk":
             weightUpdate = self._aggAndZeroTrueTopk()
-        elif self.doLocalTopk:
+        elif self.method ==  "localTopk":
             weightUpdate = self._aggAndZeroLocalTopk()
-        elif self.doRandomK:
+        elif self.method == "randomK":
             weightUpdate = self._aggAndZeroRandomK()
-        else:
+        elif self.method == "signum":
+            weightUpdate = self._aggAndZeroSignum()
+        elif self.method == "Pkk":
+            weightUpdate = self._aggAndZeroPkk()
+        elif self.method == "sketch":
             weightUpdate = self._aggAndZeroSketched()
+        else:
+            raise RuntimeError("Invalid method {}".format(self.method))
 
         # now deal with the non-compressed coordinates
-        # Note: this is a no-op if doRandomK=True, since we dealt
+        # Note: this is a no-op if self.method=randomK, since we dealt
         # with the uncompressed coords already in self._aggAndZeroRandomK()
         vs = [v[~self.sketchMask] for v in self.vs]
         weightUpdate[~self.sketchMask] = torch.sum(torch.stack(vs), dim=0)
