@@ -130,9 +130,8 @@ class SketchedModel:
 
         # override bias terms with whatever sketchBiases is
         for m in model.modules():
-            if isinstance(m, torch.nn.Linear):
-                if m.bias is not None:
-                    m.bias.do_sketching = sketchBiases
+            if hasattr(m, "bias") and m.bias is not None:
+                m.bias.do_sketching = sketchBiases
 
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
